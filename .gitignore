@@ -224,3 +224,4 @@ __marimo__/
 dataset/
 openfold/
 pdbs/
+embedding_model/tm_scores/
