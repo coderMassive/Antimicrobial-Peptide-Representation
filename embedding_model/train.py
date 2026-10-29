@@ -20,7 +20,7 @@ from models import ContactGANDeepFoldLoss, ContactGANFingerprintNet, clear_diago
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 PDB_DIRECTORY = os.environ.get("PDB_DIRECTORY", "pdbs")
 TM_SCORE_DIRECTORY = os.environ.get("TM_SCORE_DIRECTORY", "tm_scores")
-MAP_SIZE = int(os.environ.get("MAP_SIZE", "128"))
+MAP_SIZE = int(os.environ.get("MAP_SIZE", "64"))
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "64"))
 NUM_WORKERS = int(os.environ.get("NUM_WORKERS", "0"))
 EPOCHS = int(os.environ.get("EPOCHS", "100"))

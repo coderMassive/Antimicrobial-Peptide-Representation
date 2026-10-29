@@ -1,84 +1,39 @@
 import argparse
 import os
-import time
+import sys
 from pathlib import Path
 
 import numpy as np
-import requests
 import torch
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import umap
 
+sys.path.append(str(Path(__file__).resolve().parent.parent))
+
 from models import ContactGANFingerprintNet
+from peptide_data import DATASET_FILE, load_sequences
 
 
-def extract_uniprot_accession(path: str) -> str:
-    filename = os.path.basename(path)
-    base_id = os.path.splitext(filename)[0]
-    parts = base_id.split('|')
-    if len(parts) >= 2:
-        return parts[1]
-    return base_id
+def find_dataset(path):
+    candidates = [
+        Path(path),
+        Path.cwd() / DATASET_FILE,
+        Path(__file__).resolve().parent / DATASET_FILE,
+        Path(__file__).resolve().parent.parent / DATASET_FILE,
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    raise FileNotFoundError(f'Could not find {DATASET_FILE}. Pass its path with --dataset.')
 
 
-ANTIMICROBIAL_KEYWORDS = {
-    'antimicrobial',
-    'antibiotic',
-    'antibacterial',
-    'antifungal',
-    'antiviral',
-    'defensin',
-    'bacteriocin',
-}
-
-
-def fetch_keywords(uniprot_ids, batch_size=90, max_retries=3):
-    results = {}
-    ids = list(uniprot_ids)
-
-    for i in range(0, len(ids), batch_size):
-        batch = ids[i:i + batch_size]
-        query = ' OR '.join(f'accession:{uid}' for uid in batch)
-        url = 'https://rest.uniprot.org/uniprotkb/search'
-        params = {
-            'query': query,
-            'fields': 'accession,keyword',
-            'format': 'json',
-            'size': batch_size,
-        }
-
-        resp = None
-        for attempt in range(max_retries):
-            try:
-                resp = requests.get(url, params=params, timeout=30)
-                resp.raise_for_status()
-                break
-            except requests.RequestException as exc:
-                if attempt == max_retries - 1:
-                    print(f'Warning: failed UniProt batch starting at {i}: {exc}', flush=True)
-                    resp = None
-                else:
-                    time.sleep(2)
-
-        if resp is None:
-            continue
-
-        for entry in resp.json().get('results', []):
-            acc = entry.get('primaryAccession')
-            kws = [
-                kw.get('name', '').lower()
-                for kw in entry.get('keywords', [])
-            ]
-            if acc:
-                results[acc] = kws
-
-        print(
-            f'Fetched UniProt keywords for {min(i + batch_size, len(ids))}/{len(ids)} accessions',
-            flush=True,
-        )
-
-    return results
+def load_amp_labels(dataset_path):
+    peptides = load_sequences(dataset_path)
+    return {
+        peptide['id']: 0 if 'non' in str(peptide['label']).lower() else 1
+        for peptide in peptides
+    }
 
 
 def parse_ca_coordinates(pdb_path: str):
@@ -154,6 +109,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('checkpoint')
     parser.add_argument('--pdb-directory', default='pdbs')
+    parser.add_argument('--dataset', default=DATASET_FILE)
     parser.add_argument('--output', default='umap_amp.png')
     parser.add_argument('--batch-size', type=int, default=32)
     parser.add_argument('--n-neighbors', type=int, default=15)
@@ -166,6 +122,13 @@ def main():
     pdb_files = sorted(str(p) for p in Path(args.pdb_directory).glob('*.pdb'))
     if not pdb_files:
         raise FileNotFoundError(f'No PDB files found in {args.pdb_directory}')
+
+    label_map = load_amp_labels(find_dataset(args.dataset))
+    all_pdb_count = len(pdb_files)
+    pdb_files = [p for p in pdb_files if Path(p).stem in label_map]
+    print(f'PDB files in folder: {all_pdb_count}, matching the dataset: {len(pdb_files)}', flush=True)
+    if not pdb_files:
+        raise FileNotFoundError('No PDB file names match the dataset ids.')
 
     model, map_size, contact_cutoff = load_model(args.checkpoint, device)
     print(f'PDB files: {len(pdb_files)}', flush=True)
@@ -204,32 +167,11 @@ def main():
     fingerprints = np.concatenate(fingerprints, axis=0)
     print(f'Fingerprint shape: {fingerprints.shape}', flush=True)
 
-    accessions = [extract_uniprot_accession(path) for path in valid_paths]
-
-    print('Example parsed UniProt accessions:', flush=True)
-    for path, acc in list(zip(valid_paths, accessions))[:20]:
-        print(f'  {os.path.basename(path)} -> {acc}', flush=True)
-
-    unique_ids = sorted(set(accessions))
-    print(f'Requesting {len(unique_ids)} unique UniProt accessions', flush=True)
-    keyword_map = fetch_keywords(unique_ids)
-    print(f'UniProt returned {len(keyword_map)} records', flush=True)
-
-    antimicrobial_set = set()
-    for acc, kws in keyword_map.items():
-        if any(
-            any(term in kw for term in ANTIMICROBIAL_KEYWORDS)
-            for kw in kws
-        ):
-            antimicrobial_set.add(acc)
-
-    labels = np.array([
-        1 if acc in antimicrobial_set else 0
-        for acc in accessions
-    ], dtype=np.int8)
+    ids = [Path(path).stem for path in valid_paths]
+    labels = np.array([label_map[i] for i in ids], dtype=np.int8)
 
     print(
-        f'Annotated antimicrobial peptides: {int(labels.sum())} / {len(labels)}',
+        f'AMP: {int(labels.sum())}, non-AMP: {int((labels == 0).sum())}, total: {len(labels)}',
         flush=True,
     )
 
@@ -249,8 +191,8 @@ def main():
     plt.scatter(
         embedding_2d[other_mask, 0],
         embedding_2d[other_mask, 1],
-        c='#FF3B30',
-        label=f'Not annotated as AMP (n={int(other_mask.sum())})',
+        c='#007AFF',
+        label=f'Non-AMP (n={int(other_mask.sum())})',
         edgecolors='none',
         s=10,
         alpha=0.9,
@@ -260,13 +202,13 @@ def main():
         embedding_2d[anti_mask, 0],
         embedding_2d[anti_mask, 1],
         c='#FF3B30',
-        label=f'Annotated AMP (n={int(anti_mask.sum())})',
+        label=f'AMP (n={int(anti_mask.sum())})',
         edgecolors='none',
         s=18,
         alpha=0.9,
         zorder=2,
     )
-    plt.title('UMAP of Structural Fingerprints by Antimicrobial Annotation')
+    plt.title('UMAP of Structural Fingerprints: AMP vs Non-AMP')
     plt.xlabel('UMAP 1')
     plt.ylabel('UMAP 2')
     plt.legend(loc='best')
@@ -279,7 +221,7 @@ def main():
     np.savez_compressed(
         output_npz,
         names=np.array([os.path.basename(p) for p in valid_paths]),
-        uniprot_accessions=np.array(accessions),
+        ids=np.array(ids),
         fingerprints=fingerprints,
         labels=labels,
         umap=embedding_2d,
@@ -291,4 +233,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
